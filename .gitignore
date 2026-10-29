@@ -1,0 +1,5 @@
+work/
+_site/
+output/
+report.json
+__pycache__/
