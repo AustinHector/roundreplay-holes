@@ -90,13 +90,14 @@ class PipelineTests(unittest.TestCase):
         with open(os.path.join(self.tmp, "out", "build.json")) as f:
             info = json.load(f)
         self.assertEqual(set(info), {"generated", "osm_base", "files", "bytes", "largest", "course_list_ids",
-                                     "course_list_missing", "regions", "regions_added", "seconds"})
+                                     "course_list_missing", "regions", "regions_added", "seconds", "shards"})
         self.assertEqual(info["files"], 1)
         self.assertEqual(info["largest"]["id"], "osm:way:27130579")
         self.assertEqual(info["largest"]["bytes"], info["bytes"])
         self.assertEqual((info["course_list_ids"], info["course_list_missing"]), (1, 0))
         self.assertEqual(info["regions"], ["keaton.osm"])
         self.assertEqual(info["regions_added"], [])
+        self.assertEqual(info["shards"], [])  # the single job has no shards
         self.assertIsNone(info["osm_base"])  # an input with no timestamp
         self.assertIn("assign-trim-write", info["seconds"])
 

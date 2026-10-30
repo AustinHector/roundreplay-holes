@@ -5,6 +5,14 @@
                    [--region-index URL_OR_FILE] [--course-list URL_OR_FILE]
                    [--previous-build FILE] [--min-files N] [--report FILE]
                    [--dry-run]
+  python3 build.py --plan-out FILE [--shards N] [--regions ID,ID | --input FILE ...]
+  python3 build.py --plan FILE --shard K --work DIR --shard-out DIR
+  python3 build.py --plan FILE --from-shards DIR --work DIR --output DIR
+
+The first form builds everything in one job. The other three split it (D009):
+plan picks the regions once and deals them to N shards by bytes, each shard
+job downloads, filters and cuts its own regions, and merge joins the shards'
+near-course files and finishes as the single job does.
 
 Regions are filtered, cut to the area near golf courses and discarded one at
 a time; the small near-course files are then merged, assigned to courses,
@@ -45,6 +53,11 @@ MAX_FILE_BYTES = 1_000_000  # guard 4
 # hold territories no state file covers.
 AGGREGATES = {"us", "us-midwest", "us-northeast", "us-south", "us-west",
               "alps", "britain-and-ireland", "dach", "great-britain", "sea"}
+DOWNLOAD_ATTEMPTS = 8
+RETRY_WAITS = (10, 30, 60, 120, 240, 300, 300)  # seconds before attempt 2, 3, ...; tests set zeros
+OPEN_RETRY_WAIT = 5
+SHARDS = 8
+SHARD_RECORD = "shard.json"
 USER_AGENT = "roundreplay-holes-build (https://github.com/AustinHector/roundreplay-holes)"
 RSS_UNIT = "bytes" if sys.platform == "darwin" else "KB"
 RSS_SCALE = 1 if sys.platform == "darwin" else 1024
@@ -132,8 +145,8 @@ def run(cmd, capture=False):
     return out.decode("utf-8", "replace").strip()
 
 
-def open_url(url, method="GET"):
-    req = urllib.request.Request(url, method=method, headers={"User-Agent": USER_AGENT})
+def open_url(url, method="GET", headers=None):
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": USER_AGENT, **(headers or {})})
     for attempt in (1, 2, 3):
         try:
             return urllib.request.urlopen(req, timeout=60)
@@ -143,7 +156,7 @@ def open_url(url, method="GET"):
             log(f"{method} {url} attempt {attempt} failed: {e}")
             if attempt == 3:
                 raise
-            time.sleep(5)
+            time.sleep(OPEN_RETRY_WAIT)
 
 
 # --- Regions ----------------------------------------------------------------
@@ -655,31 +668,64 @@ def trim(course_id, elements):
 
 # --- Build -------------------------------------------------------------------
 
+class BadRange(Exception):
+    pass
+
+
+def range_start(value):
+    """The first byte of a Content-Range header, or None."""
+    m = re.match(r"bytes (\d+)-\d+/(\d+|\*)$", value or "")
+    return int(m.group(1)) if m else None
+
+
 def download(url, dest):
-    for attempt in (1, 2):
+    """Downloads url to dest, resuming a failed attempt from the bytes on disk
+    (D009). Resumes against the URL the first response came from, with
+    If-Range set to its ETag or Last-Modified; a 200 is written from byte 0."""
+    src, validator, total = url, None, None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        have = os.path.getsize(dest) if os.path.exists(dest) else 0
+        if have and not validator:
+            have = 0  # nothing ties the bytes on disk to one file version
+        headers = {"Range": f"bytes={have}-", "If-Range": validator} if have else {}
+        if have:
+            log(f"download resume: attempt {attempt}, keeping {have} bytes of {src}")
         t = time.time()
         got = 0
         try:
-            with open_url(url) as r, open(dest, "wb") as f:
-                expected = r.headers.get("Content-Length")
-                while True:
-                    chunk = r.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    got += len(chunk)
-            if expected is not None and got != int(expected):
-                raise OSError(f"got {got} bytes, Content-Length said {expected}")
-            STATE["downloaded_bytes"] += got
-            STATE["download_seconds"] += time.time() - t
-            return got
+            with open_url(src, headers=headers) as r:
+                if have and r.status == 206:
+                    if range_start(r.headers.get("Content-Range")) != have:
+                        raise BadRange(f"206 starts at {r.headers.get('Content-Range')}, not at byte {have}")
+                    mode = "ab"
+                else:
+                    have, mode = 0, "wb"
+                    src = r.geturl()
+                    validator = r.headers.get("ETag") or r.headers.get("Last-Modified")
+                    length = r.headers.get("Content-Length")
+                    total = int(length) if length is not None else None
+                with open(dest, mode) as f:
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+            size = have + got
+            if total is not None and size != total:
+                raise OSError(f"got {size} bytes, expected {total}")
+            return size
         except Exception as e:
+            log(f"download attempt {attempt} of {DOWNLOAD_ATTEMPTS} failed: {e}")
+            if isinstance(e, BadRange) or (isinstance(e, urllib.error.HTTPError) and e.code in (404, 410, 416)):
+                src, validator = url, None  # start over from the original URL
+                safe_remove(dest)
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            time.sleep(RETRY_WAITS[min(attempt, len(RETRY_WAITS)) - 1])
+        finally:
             STATE["downloaded_bytes"] += got
             STATE["download_seconds"] += time.time() - t
-            log(f"download attempt {attempt} failed: {e}")
-            if attempt == 2:
-                raise
-            time.sleep(10)
 
 
 def note_free_disk(work, rec):
@@ -773,7 +819,7 @@ def write_report(args, result):
               "regions": result["regions"], "steps": STEPS, "file_count": result["count"], "compressed_bytes": result["total"],
               "downloaded_bytes": STATE["downloaded_bytes"], "download_seconds": round(STATE["download_seconds"], 1),
               "min_free_bytes": STATE["min_free_bytes"], "total_seconds": round(time.time() - T0, 1)}
-    if result["ok"] and not args.dry_run:
+    if result["ok"] and not args.dry_run and args.mode in ("single", "merge"):
         try:
             listed = load_course_list(args.course_list)
             hit = sum(1 for i in listed if i in result["found_ids"])
@@ -897,7 +943,7 @@ def write_build_json(path, result, v1_dir):
             "largest": {"id": big[:-len(".json.gz")].replace("-", ":"), "bytes": sizes[big]} if big else None,
             "course_list_ids": cov["listed"], "course_list_missing": cov["listed"] - cov["found"],
             "regions": [r["region"] for r in result["regions"]], "regions_added": result["regions_added"],
-            "seconds": stage_seconds()}
+            "seconds": stage_seconds(), "shards": result["shards"]}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(info, f, indent=1)
         f.write("\n")
@@ -905,7 +951,8 @@ def write_build_json(path, result, v1_dir):
 
 # --- Build -------------------------------------------------------------------
 
-def build(args, result):
+def pick_jobs(args, result):
+    """The regions to process as [(id, url, size, local, slug)]."""
     only = [r.strip() for r in args.regions.split(",") if r.strip()]
     if args.input and only:
         raise SystemExit("--input and --regions cannot be used together")
@@ -914,11 +961,14 @@ def build(args, result):
             raise SystemExit(f"input file not found: {path}")
 
     if args.input:
-        jobs = [(os.path.basename(p), None, None, p, f"input{i}") for i, p in enumerate(args.input, 1)]
-    else:
-        with step("region-list"):
-            regions, result["regions_added"] = choose_regions(only, args.region_index)
-        jobs = [(rid, url, size, None, None) for rid, url, size in regions]
+        return [(os.path.basename(p), None, os.path.getsize(p), p, f"input{i}") for i, p in enumerate(args.input, 1)]
+    with step("region-list"):
+        regions, result["regions_added"] = choose_regions(only, args.region_index)
+    return [(rid, url, size, None, None) for rid, url, size in regions]
+
+
+def build(args, result):
+    jobs = pick_jobs(args, result)
     if args.dry_run:
         return
 
@@ -927,15 +977,23 @@ def build(args, result):
         process_region(rid, url, size, args.work, found_ids, region_recs, local, slug)
 
     near_files = [r["near_file"] for r in region_recs if "near_file" in r]
+    finish(args, result, near_files, remove=True)
+
+
+def finish(args, result, near_files, remove):
+    """Merge, assign, trim, guards, build.json and the move to --output: the
+    steps the single job and the merge job share."""
     if not near_files:
         raise SystemExit("no region produced a near-course file")
+    region_recs = result["regions"]
     merged = os.path.join(args.work, "merged.osm.pbf")
     near_opl = os.path.join(args.work, "near.opl")
     with step("merge"):
         # Confirmed by experiment (report builder-01): merging a file with itself
         # leaves the object counts unchanged, so duplicates collapse.
         run(["osmium", "merge", *near_files, "-o", merged, "--overwrite"])
-        safe_remove(*near_files)
+        if remove:
+            safe_remove(*near_files)
     with step("add-locations"):
         run(["osmium", "add-locations-to-ways", merged, "-f", "opl,add_metadata=false", "-o", near_opl, "--overwrite"])
     with step("load"):
@@ -973,30 +1031,240 @@ def build(args, result):
     log(f"published {result['count']} files to {args.output}")
 
 
-def main():
+# --- Plan, shard and merge (D009) -----------------------------------------------
+
+def assign_shards(sizes, n):
+    """Shard index per size: largest first, each to the shard holding the
+    fewest bytes so far, ties to the lowest index."""
+    loads = [0] * n
+    out = [0] * len(sizes)
+    for i in sorted(range(len(sizes)), key=lambda i: (-sizes[i], i)):
+        k = min(range(n), key=lambda k: (loads[k], k))
+        out[i] = k
+        loads[k] += sizes[i]
+    return out
+
+
+def read_plan(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            plan = json.load(f)
+        plan["shards"], plan["regions"]
+    except Exception as e:
+        raise SystemExit(f"--plan {path} is unreadable: {e!r}")
+    return plan
+
+
+def plan_build(args, result):
+    jobs = pick_jobs(args, result)
+    if args.shards < 1:
+        raise SystemExit("--shards must be at least 1")
+    ids = [j[0] for j in jobs]
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise SystemExit(f"the plan would list a region twice: {', '.join(dupes)}")
+    which = assign_shards([j[2] for j in jobs], args.shards)
+    regions = [{"id": rid, "url": url, "bytes": size, "shard": k,
+                "local": os.path.abspath(local) if local else None,
+                "slug": slug or rid.replace("/", "-")}
+               for (rid, url, size, local, slug), k in zip(jobs, which)]
+    for k in range(args.shards):
+        mine = [r for r in regions if r["shard"] == k]
+        log(f"shard {k}: {len(mine)} regions, {sum(r['bytes'] for r in mine) / 1e9:.2f} GB")
+    os.makedirs(os.path.dirname(os.path.abspath(args.plan_out)), exist_ok=True)
+    with open(args.plan_out, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "shards": args.shards, "regions": regions,
+                   "regions_added": result["regions_added"]}, f, indent=1)
+        f.write("\n")
+    log(f"plan written to {args.plan_out}: {len(regions)} regions in {args.shards} shards")
+    result["regions"] = [{"region": r["id"]} for r in regions]
+
+
+def shard_build(args, result):
+    plan = read_plan(args.plan)
+    if not 0 <= args.shard < plan["shards"]:
+        raise SystemExit(f"--shard {args.shard} is outside 0 to {plan['shards'] - 1}")
+    mine = [r for r in plan["regions"] if r["shard"] == args.shard]
+    log(f"shard {args.shard} of {plan['shards']}: {len(mine)} regions")
+    found_ids, recs = result["found_ids"], result["regions"]
+    os.makedirs(os.path.join(args.shard_out, "regions"), exist_ok=True)
+    for r in mine:
+        rec = process_region(r["id"], r["url"], r["bytes"], args.work, found_ids, recs, r["local"], r["slug"])
+        if "near_file" in rec:
+            rel = os.path.join("regions", f"{r['slug']}-near.osm.pbf")
+            shutil.copyfile(rec["near_file"], os.path.join(args.shard_out, rel))
+            safe_remove(rec["near_file"])
+            rec["near_file"] = rel
+    record = {"version": 1, "shard": args.shard, "regions": recs, "found_ids": sorted(found_ids),
+              "downloaded_bytes": STATE["downloaded_bytes"], "download_seconds": round(STATE["download_seconds"], 1),
+              "min_free_bytes": STATE["min_free_bytes"], "seconds": round(time.time() - T0, 1), "steps": STEPS}
+    with open(os.path.join(args.shard_out, SHARD_RECORD), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=1)
+    log(f"shard {args.shard} done: {len(recs)} regions")
+
+
+def read_shards(plan, folder):
+    """Every immediate subfolder of folder holding a shard record is one
+    shard. Returns ({shard index: (folder, record)}, [problems])."""
+    found, problems = {}, []
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name, SHARD_RECORD)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                record = json.load(f)
+            k = int(record["shard"])
+        except Exception as e:
+            problems.append(f"shard record {path} is unreadable: {e!r}")
+            continue
+        if k in found:
+            problems.append(f"shard {k} has two records: {found[k][0]} and {os.path.join(folder, name)}")
+        elif not 0 <= k < plan["shards"]:
+            problems.append(f"{path} is shard {k}, outside 0 to {plan['shards'] - 1}")
+        else:
+            found[k] = (os.path.join(folder, name), record)
+    return found, problems
+
+
+def check_shards(plan, found, problems):
+    """Adds every way the shards disagree with the plan to problems."""
+    for k in range(plan["shards"]):
+        if k not in found:
+            problems.append(f"shard {k} has no record")
+    seen = {}
+    for k, (folder, record) in sorted(found.items()):
+        for rec in record["regions"]:
+            seen.setdefault(rec["region"], []).append((k, folder, rec))
+    planned = {r["id"]: r for r in plan["regions"]}
+    for rid, plan_rec in planned.items():
+        hits = seen.get(rid, [])
+        if not hits:
+            if plan_rec["shard"] in found:
+                problems.append(f"region {rid} is missing: shard {plan_rec['shard']} did not record it")
+            else:
+                problems.append(f"region {rid} is missing")
+        elif len(hits) > 1:
+            problems.append(f"region {rid} is recorded twice, by shards {', '.join(str(h[0]) for h in hits)}")
+        else:
+            k, folder, rec = hits[0]
+            if k != plan_rec["shard"]:
+                problems.append(f"region {rid} was planned for shard {plan_rec['shard']} but shard {k} recorded it")
+            if rec.get("boxes_after_merge") and "near_file" not in rec:
+                problems.append(f"region {rid} (shard {k}) has course boxes but no near-course file")
+            elif "near_file" in rec:
+                path = os.path.normpath(os.path.join(folder, rec["near_file"]))
+                if not path.startswith(os.path.normpath(folder) + os.sep) or not os.path.isfile(path):
+                    problems.append(f"region {rid} (shard {k}) near-course file {rec['near_file']} is absent")
+    for rid in sorted(set(seen) - set(planned)):
+        problems.append(f"region {rid} is recorded but not in the plan")
+    return problems
+
+
+def merge_build(args, result):
+    plan = read_plan(args.plan)
+    if not os.path.isdir(args.from_shards):
+        raise SystemExit(f"--from-shards {args.from_shards} is not a folder")
+    found, problems = read_shards(plan, args.from_shards)
+    problems = check_shards(plan, found, problems)
+    if problems:
+        raise SystemExit(f"the shards do not match the plan ({len(problems)} problems):\n" + "\n".join(problems))
+
+    by_region = {rec["region"]: (folder, rec) for folder, record in found.values() for rec in record["regions"]}
+    near_files = []
+    for r in plan["regions"]:
+        folder, rec = by_region[r["id"]]
+        result["regions"].append(rec)
+        if "near_file" in rec:
+            near_files.append(os.path.normpath(os.path.join(folder, rec["near_file"])))
+    result["regions_added"] = plan.get("regions_added", [])
+    shard_steps = []
+    for k, (_, record) in sorted(found.items()):
+        result["found_ids"].update(record["found_ids"])
+        STATE["downloaded_bytes"] += record["downloaded_bytes"]
+        STATE["download_seconds"] += record["download_seconds"]
+        free = record.get("min_free_bytes")
+        if free is not None and (STATE["min_free_bytes"] is None or free < STATE["min_free_bytes"]):
+            STATE["min_free_bytes"] = free
+        shard_steps += record["steps"]
+        result["shards"].append({"shard": k, "regions": len(record["regions"]),
+                                 "bytes": record["downloaded_bytes"],
+                                 "download_seconds": record["download_seconds"],
+                                 "seconds": record["seconds"]})
+    STEPS[:0] = shard_steps  # so the report and build.json sum every shard's steps
+    finish(args, result, near_files, remove=False)
+
+
+MODE_FLAGS = {
+    "single": {"work", "output", "regions", "input", "region_index", "course_list", "previous_build",
+               "min_files", "report", "dry_run"},
+    "plan": {"plan_out", "shards", "regions", "input", "region_index", "report"},
+    "shard": {"plan", "shard", "work", "shard_out", "report"},
+    "merge": {"plan", "from_shards", "work", "output", "course_list", "previous_build", "min_files", "report"},
+}
+MODE_REQUIRED = {"single": ("work", "output"), "plan": ("plan_out",), "shard": ("plan", "shard", "work", "shard_out"),
+                 "merge": ("plan", "from_shards", "work", "output")}
+MODE_FORM = {"single": "the default build", "plan": "--plan-out", "shard": "--shard", "merge": "--from-shards"}
+
+
+def flag(dest):
+    return "--" + dest.replace("_", "-")
+
+
+def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--work", required=True)
-    ap.add_argument("--output", required=True)
+    ap.add_argument("--work")
+    ap.add_argument("--output")
     ap.add_argument("--regions", default="")
     ap.add_argument("--input", action="append", default=[], help="local .osm or .osm.pbf file instead of Geofabrik regions; repeatable")
-    ap.add_argument("--region-index", default=INDEX_URL, help="Geofabrik index-v1.json, file or URL")
-    ap.add_argument("--course-list", default=COURSE_LIST_URL)
+    ap.add_argument("--region-index", help="Geofabrik index-v1.json, file or URL")
+    ap.add_argument("--course-list")
     ap.add_argument("--previous-build", help="the last build.json")
-    ap.add_argument("--min-files", type=int, default=MIN_FILES)
+    ap.add_argument("--min-files", type=int)
     ap.add_argument("--report")
     ap.add_argument("--dry-run", action="store_true", help="print the region list and stop")
+    ap.add_argument("--plan-out", help="plan mode: write the plan here and stop")
+    ap.add_argument("--shards", type=int, help="plan mode: number of shards (default 8)")
+    ap.add_argument("--plan", help="shard and merge modes: the plan file")
+    ap.add_argument("--shard", type=int, help="shard mode: the shard index to build")
+    ap.add_argument("--shard-out", help="shard mode: folder for the near-course files and the shard record")
+    ap.add_argument("--from-shards", help="merge mode: folder whose subfolders each hold one shard")
     args = ap.parse_args()
 
-    if os.path.exists(args.output) and (not os.path.isdir(args.output) or os.listdir(args.output)):
+    given = {d for d, v in vars(args).items() if v != ap.get_default(d)}
+    modes = [m for m, trigger in (("plan", "plan_out"), ("shard", "shard"), ("merge", "from_shards")) if trigger in given]
+    if len(modes) > 1:
+        ap.error(f"{' and '.join(MODE_FORM[m] for m in modes)} are different modes; use one")
+    if not modes and "plan" in given:
+        ap.error("--plan goes with --shard (build one shard) or --from-shards (merge)")
+    args.mode = modes[0] if modes else "single"
+    stray = sorted(given - MODE_FLAGS[args.mode])
+    if stray:
+        ap.error(f"{', '.join(flag(d) for d in stray)} cannot be used with {MODE_FORM[args.mode]}")
+    missing = [flag(d) for d in MODE_REQUIRED[args.mode] if getattr(args, d) is None]
+    if missing:
+        ap.error(f"{MODE_FORM[args.mode]} also needs {', '.join(missing)}")
+    args.region_index = args.region_index or INDEX_URL
+    args.course_list = args.course_list or COURSE_LIST_URL
+    args.min_files = MIN_FILES if args.min_files is None else args.min_files
+    args.shards = SHARDS if args.shards is None else args.shards
+    return args
+
+
+def main():
+    args = parse_args()
+
+    if args.output and os.path.exists(args.output) and (not os.path.isdir(args.output) or os.listdir(args.output)):
         raise SystemExit(f"--output {args.output} must be absent or an empty folder")
-    os.makedirs(args.work, exist_ok=True)
-    STATE["work"] = args.work
+    if args.work:
+        os.makedirs(args.work, exist_ok=True)
+        STATE["work"] = args.work
     signal.signal(signal.SIGTERM, terminate)  # GitHub sends it on cancel and timeout
 
     result = {"ok": False, "error": None, "generated": now(), "osm_base": None, "count": 0, "total": 0,
-           "found_ids": set(), "regions": [], "regions_added": []}
+           "found_ids": set(), "regions": [], "regions_added": [], "shards": []}
     try:
-        build(args, result)
+        {"single": build, "plan": plan_build, "shard": shard_build, "merge": merge_build}[args.mode](args, result)
         result["ok"] = True
     except BaseException as e:
         result["error"] = str(e.code) if isinstance(e, SystemExit) and e.code is not None else repr(e)

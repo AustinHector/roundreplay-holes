@@ -2,8 +2,8 @@
 
 Hole maps for RoundReplay: one gzip file per golf course, built from OpenStreetMap every Sunday.
 
-- `build.py` downloads Geofabrik's regional extracts one at a time, keeps the golf data near each course, and writes `v1/<course id>.json.gz`: the course id with `:` replaced by `-`, for example `v1/osm-way-27130579.json.gz`.
-- `.github/workflows/build.yml` runs the tests and the build on Sundays at 06:00 UTC, or by hand, then deploys the files to GitHub Pages. It deploys only when four publish guards pass; otherwise the run fails and the last deployment stays live.
+- `build.py` downloads Geofabrik's regional extracts one at a time, resuming a download that drops from the bytes already on disk, keeps the golf data near each course, and writes `v1/<course id>.json.gz`: the course id with `:` replaced by `-`, for example `v1/osm-way-27130579.json.gz`.
+- `.github/workflows/build.yml` runs the tests and the build on Sundays at 06:00 UTC, or by hand, then deploys the files to GitHub Pages. A plan job picks the regions and deals them to 8 shards by size; 8 shard jobs run at once, each downloading and cutting its own regions; a merge job joins what they return, assigns and trims the files and runs the guards. It deploys only when four publish guards pass; otherwise the run fails and the last deployment stays live.
 - `build.json` records the last published build: file counts, sizes, the OpenStreetMap date, course-list coverage and stage timings. Each successful build commits it.
 - `python3 -m unittest` runs the tests. They need `osmium-tool` and no network.
 

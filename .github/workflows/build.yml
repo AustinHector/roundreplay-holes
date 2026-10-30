@@ -24,9 +24,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Install osmium-tool
@@ -36,14 +36,86 @@ jobs:
           osmium --version
       - name: Run the tests
         run: python3 -m unittest
-      - name: Build hole maps
+      - name: Plan the shards
         env:
           REGIONS: ${{ inputs.regions }}
+        run: |
+          args=(--plan-out plan.json --shards 8 --report report-plan.json)
+          if [ -n "$REGIONS" ]; then args+=(--regions "$REGIONS"); fi
+          python3 build.py "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plan
+          path: plan.json
+          retention-days: 1
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: report-plan
+          path: report-plan.json
+          if-no-files-found: ignore
+
+  shard:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: true
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install osmium-tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          osmium --version
+      - uses: actions/download-artifact@v8
+        with:
+          name: plan
+          path: ${{ runner.temp }}/plan
+      - name: Build the shard
+        run: |
+          python3 build.py --plan "${{ runner.temp }}/plan/plan.json" --shard ${{ matrix.shard }} \
+            --work "${{ runner.temp }}/work" --shard-out shard-out --report report-shard-${{ matrix.shard }}.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard-out
+          retention-days: 1
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: report-shard-${{ matrix.shard }}
+          path: report-shard-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+
+  merge:
+    needs: shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install osmium-tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          osmium --version
+      - uses: actions/download-artifact@v8
+        with:
+          name: plan
+          path: ${{ runner.temp }}/plan
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: shard-*
+          path: ${{ runner.temp }}/shards
+      - name: Merge the shards
+        env:
           MIN_FILES: ${{ inputs.min_files }}
         run: |
-          args=(--work "${{ runner.temp }}/work" --output _site --report report.json)
+          args=(--plan "${{ runner.temp }}/plan/plan.json" --from-shards "${{ runner.temp }}/shards"
+                --work "${{ runner.temp }}/work" --output _site --report report-merge.json)
           if [ -f build.json ]; then args+=(--previous-build build.json); fi
-          if [ -n "$REGIONS" ]; then args+=(--regions "$REGIONS"); fi
           if [ -n "$MIN_FILES" ]; then args+=(--min-files "$MIN_FILES"); fi
           python3 build.py "${args[@]}"
       - uses: actions/upload-pages-artifact@v5
@@ -52,8 +124,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: report
-          path: report.json
+          name: report-merge
+          path: report-merge.json
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
         with:
@@ -61,7 +133,7 @@ jobs:
           path: _site/build.json
 
   deploy:
-    needs: build
+    needs: merge
     runs-on: ubuntu-latest
     permissions:
       pages: write
