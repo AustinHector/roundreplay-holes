@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Builds the per-course hole map files from Geofabrik extracts.
 
-  python3 build.py --work DIR --output DIR [--regions ID,ID]
-                   [--course-list URL_OR_FILE] [--report FILE] [--dry-run]
+  python3 build.py --work DIR --output DIR [--regions ID,ID | --input FILE ...]
+                   [--region-index URL_OR_FILE] [--course-list URL_OR_FILE]
+                   [--previous-build FILE] [--min-files N] [--report FILE]
+                   [--dry-run]
 
 Regions are filtered, cut to the area near golf courses and discarded one at
 a time; the small near-course files are then merged, assigned to courses,
-trimmed and written as <output>/v1/<course id>.json.gz. Needs osmium-tool on
-PATH. Python standard library only. The boxes, assign and trim logic is the
-measured prototype's (FINDINGS F002-F008), kept whole-in-memory.
+trimmed and written as <output>/v1/<course id>.json.gz. The set is built in
+a staging folder under --work, checked by four publish guards, and moved to
+--output (which must start absent or empty) only when all pass. Needs
+osmium-tool on PATH. Python standard library only. The boxes, assign and
+trim logic is the measured prototype's (FINDINGS F002-F008), kept
+whole-in-memory.
 """
 import argparse
 import gzip
@@ -28,9 +33,13 @@ from concurrent.futures import ThreadPoolExecutor
 from array import array
 from datetime import datetime, timezone
 
-INDEX_URL = "https://download.geofabrik.de/index-v1-nogeom.json"
+INDEX_URL = "https://download.geofabrik.de/index-v1.json"
 COURSE_LIST_URL = "https://austinhector.github.io/roundreplay/courses-v1.json"
 SPLIT_OVER = 6_000_000_000
+MIN_FILES = 15_000       # guard 1
+MAX_DROP = 0.05          # guard 1
+MAX_MISSING = 0.01       # guard 3
+MAX_FILE_BYTES = 1_000_000  # guard 4
 # Geofabrik lists these beside their own parts (all of `us` beside every
 # state), so downloading them only repeats data. `us-pacific` stays: it may
 # hold territories no state file covers.
@@ -144,14 +153,24 @@ def head_size(url):
         return int(r.headers["Content-Length"])
 
 
-def choose_regions(only):
-    with open_url(INDEX_URL) as r:
-        feats = [f["properties"] for f in json.load(r)["features"]]
-    by_id = {p["id"]: p for p in feats}
+def load_index(src):
+    if src.startswith(("http://", "https://")):
+        with open_url(src) as r:
+            return json.load(r)["features"]
+    with open(src, encoding="utf-8") as f:
+        return json.load(f)["features"]
+
+
+def choose_regions(only, index_src):
+    """Returns ([(id, url, size)], [{"region", "point"}] the shape check added)."""
+    feats = load_index(index_src)
+    props = [f["properties"] for f in feats]
+    added = []
     if only:
         chosen = []
         for want in only:
-            hit = by_id.get(want) or next((p for p in feats if p["id"].split("/")[-1] == want), None)
+            hit = next((p for p in props if p["id"] == want), None) \
+                or next((p for p in props if p["id"].split("/")[-1] == want), None)
             if hit is None or "pbf" not in hit.get("urls", {}):
                 raise SystemExit(f"unknown Geofabrik region id: {want}")
             chosen.append(hit)
@@ -160,17 +179,21 @@ def choose_regions(only):
         final = [(p["id"], p["urls"]["pbf"], size) for p, size in zip(chosen, sizes)]
     else:
         final = []
-        level = [p for p in feats if "parent" not in p]
-        while level:
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                sizes = list(pool.map(head_size, [p["urls"]["pbf"] for p in level]))
-            queue, level = level, []
-            for p, size in zip(queue, sizes):
-                level.extend(split_or_keep(p, size, feats, final))
+        split_level([p for p in props if "parent" not in p], props, final)
+        added = add_uncovered(feats, props, final)
     log(f"{len(final)} regions, {sum(s for _, _, s in final) / 1e9:.1f} GB to download")
     for rid, url, size in final:
         log(f"  region {rid}  {size / 1e6:.0f} MB  {url}")
-    return final
+    return final, added
+
+
+def split_level(level, props, final):
+    while level:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            sizes = list(pool.map(head_size, [p["urls"]["pbf"] for p in level]))
+        queue, level = level, []
+        for p, size in zip(queue, sizes):
+            level.extend(split_or_keep(p, size, props, final))
 
 
 def split_or_keep(p, size, feats, final):
@@ -187,6 +210,100 @@ def split_or_keep(p, size, feats, final):
         return children
     final.append((p["id"], p["urls"]["pbf"], size))
     return []
+
+
+# --- Region shapes (D007, F013) ------------------------------------------------
+
+def shape_parts(feature):
+    """A region's polygon parts as [(bbox, [ring, ...])]: outer ring first,
+    then its holes; each ring a list of (lon, lat)."""
+    geo = feature.get("geometry")
+    if not geo:
+        return None
+    polys = [geo["coordinates"]] if geo["type"] == "Polygon" else geo["coordinates"]
+    parts = []
+    for poly in polys:
+        rings = [[(pt[0], pt[1]) for pt in ring] for ring in poly]
+        if not rings or not rings[0]:
+            continue
+        xs, ys = [p[0] for p in rings[0]], [p[1] for p in rings[0]]
+        parts.append(((min(xs), min(ys), max(xs), max(ys)), rings))
+    return parts
+
+
+def crossings(rings, y):
+    """Sorted x where the horizontal line at y crosses a ring edge."""
+    xs = []
+    for ring in rings:
+        for i in range(len(ring) - 1):
+            (x1, y1), (x2, y2) = ring[i], ring[i + 1]
+            if (y1 > y) != (y2 > y):
+                xs.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+    return sorted(xs)
+
+
+def interior_point(part):
+    """Midpoint of the widest stretch inside the part on the horizontal line
+    through the middle of its bounding box (outside its holes)."""
+    (x0, y0, x1, y1), rings = part
+    y = (y0 + y1) / 2
+    xs = crossings(rings, y)
+    stretches = [(b - a, (a + b) / 2) for a, b in zip(xs[0::2], xs[1::2])]
+    if not stretches:
+        return rings[0][0]
+    return (max(stretches)[1], y)
+
+
+def in_shape(parts, x, y):
+    for (x0, y0, x1, y1), rings in parts:
+        if x0 <= x <= x1 and y0 <= y <= y1 and sum(1 for cx in crossings(rings, y) if cx > x) % 2 == 1:
+            return True
+    return False
+
+
+def add_uncovered(feats, props, final):
+    """Adds every region with a part whose interior point lies in no chosen
+    region, until a pass adds nothing. Returns [{"region", "point"}]."""
+    shapes = {f["properties"]["id"]: shape_parts(f) for f in feats}
+    points = {}
+    added = []
+    changed = True
+    while changed:
+        changed = False
+        chosen = {rid for rid, _, _ in final}
+        for rid in sorted(chosen):
+            if not shapes.get(rid):
+                raise SystemExit(f"region {rid} has no shape in the region index")
+        for p in props:
+            rid = p["id"]
+            if rid in chosen or rid in AGGREGATES or "pbf" not in p.get("urls", {}):
+                continue  # an aggregate is skipped on purpose (D005, D008); its polygon takes in sea no part covers
+            if not shapes.get(rid):
+                log(f"shape check: {rid} has no shape, skipped")
+                continue
+            if rid not in points:
+                points[rid] = [interior_point(part) for part in shapes[rid]]
+            miss = next((pt for pt in points[rid]
+                         if not any(in_shape(shapes[c], *pt) for c in chosen)), None)
+            if miss is None:
+                continue
+            log(f"shape check: adding {rid}, a part's interior point "
+                f"({miss[0]:.5f}, {miss[1]:.5f}) lies in no chosen region")
+            size = head_size(p["urls"]["pbf"])
+            if size > SPLIT_OVER:
+                kids = [c for c in props if c.get("parent") == rid and "pbf" in c.get("urls", {})
+                        and c["id"] not in AGGREGATES and c["id"] not in chosen]
+                if not kids:
+                    raise SystemExit(f"region {rid} is {size / 1e9:.1f} GB and splitting it adds no new region; "
+                                     f"its part at ({miss[0]:.5f}, {miss[1]:.5f}) is covered by no chosen region")
+                log(f"region {rid} is {size / 1e9:.1f} GB: split into {len(kids)} children")
+                split_level(kids, props, final)
+            else:
+                final.append((rid, p["urls"]["pbf"], size))
+            added.append({"region": rid, "point": [round(miss[0], 6), round(miss[1], 6)]})
+            chosen = {r for r, _, _ in final}
+            changed = True
+    return added
 
 
 # --- OPL reading and course boxes (prototype golfextract.py) -----------------
@@ -577,15 +694,17 @@ def safe_remove(*paths):
             os.remove(p)
 
 
-def process_region(rid, url, size, work, found_ids, region_recs):
-    slug = rid.replace("/", "-")
+def process_region(rid, url, size, work, found_ids, region_recs, local=None, slug=None):
+    """local is an --input file: used in place, never removed."""
+    slug = slug or rid.replace("/", "-")
     rec = {"region": rid, "bytes_expected": size}
-    pbf = os.path.join(work, f"{slug}.osm.pbf")
+    pbf = local or os.path.join(work, f"{slug}.osm.pbf")
     filtered = os.path.join(work, f"{slug}-filtered.osm.pbf")
     near = os.path.join(work, f"{slug}-near.osm.pbf")
 
-    with step("download", rid):
-        rec["bytes_downloaded"] = download(url, pbf)
+    if not local:
+        with step("download", rid):
+            rec["bytes_downloaded"] = download(url, pbf)
     with step("fileinfo", rid):
         stamp = run(["osmium", "fileinfo", "-g", "header.option.timestamp", pbf], capture=True)
         if not stamp:
@@ -612,7 +731,7 @@ def process_region(rid, url, size, work, found_ids, region_recs):
         with step("extract", rid):
             run(["osmium", "extract", "-p", boxes_path, "-s", "smart", filtered, "-o", near, "--overwrite"])
         rec["near_file"] = near
-    safe_remove(boxes_path if rec["boxes_after_merge"] else "", pbf, filtered)  # the next region needs the disk
+    safe_remove(boxes_path if rec["boxes_after_merge"] else "", "" if local else pbf, filtered)  # the next region needs the disk
     note_free_disk(work, rec)
     region_recs.append(rec)
     return rec
@@ -676,17 +795,136 @@ def terminate(signum, frame):
     raise SystemExit(f"terminated by signal {signum}")
 
 
+# --- Publish guards -----------------------------------------------------------
+
+def check_file_count(count, min_files, previous):
+    """Guard 1. previous is the last build's file count, or None."""
+    fails = []
+    if count < min_files:
+        fails.append(f"guard 1 (file count): {count} files, at least {min_files} required")
+    if previous is None:
+        log("guard 1: no previous build, the 5% drop check is skipped")
+    elif count < previous * (1 - MAX_DROP):
+        fails.append(f"guard 1 (file count): {count} files is {100.0 * (previous - count) / previous:.1f}% "
+                     f"fewer than the previous build's {previous}, at most {MAX_DROP * 100:.0f}% allowed")
+    return fails
+
+
+def check_contents(v1_dir):
+    """Guard 2: every file inflates and holds an elements array with a golf=hole."""
+    bad = []
+    for name in sorted(os.listdir(v1_dir)):
+        try:
+            with gzip.open(os.path.join(v1_dir, name), "rb") as f:
+                elements = json.loads(f.read().decode("utf-8"))["elements"]
+            if not isinstance(elements, list) or not any((e.get("tags") or {}).get("golf") == "hole" for e in elements):
+                raise ValueError("no golf=hole element")
+        except Exception as e:
+            bad.append(f"{name} ({e})")
+    if not bad:
+        return []
+    return [f"guard 2 (file contents): {len(bad)} files do not inflate or hold a golf=hole, none allowed; "
+            f"first: {', '.join(bad[:5])}"]
+
+
+def check_coverage(listed, found):
+    """Guard 3. Returns (failures, coverage record)."""
+    hit = sum(1 for i in listed if i in found)
+    missing = len(listed) - hit
+    cov = {"listed": len(listed), "found": hit, "percent": 100.0 * hit / max(1, len(listed))}
+    if not listed:
+        return ["guard 3 (course list coverage): the course list has 0 usable ids, at least 1 required"], cov
+    if missing > len(listed) * MAX_MISSING:
+        return [f"guard 3 (course list coverage): {missing} of {len(listed)} listed ids have no outline "
+                f"({100.0 * missing / len(listed):.2f}%), at most {MAX_MISSING * 100:.0f}% allowed"], cov
+    return [], cov
+
+
+def check_sizes(v1_dir):
+    """Guard 4: no file over MAX_FILE_BYTES compressed."""
+    sizes = [(os.path.getsize(os.path.join(v1_dir, n)), n) for n in os.listdir(v1_dir)]
+    big = sorted((b, n) for b, n in sizes if b > MAX_FILE_BYTES)[::-1]
+    if not big:
+        return []
+    return [f"guard 4 (file size): {len(big)} files over {MAX_FILE_BYTES} bytes, none allowed; "
+            f"largest {big[0][1]} at {big[0][0]} bytes"]
+
+
+def read_previous(path):
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return int(json.load(f)["files"])
+
+
+def run_guards(args, result, v1_dir):
+    """Runs all four and reports every failure, not just the first."""
+    fails = []
+    try:
+        previous = read_previous(args.previous_build)
+    except Exception as e:
+        previous = None
+        fails.append(f"guard 1 (file count): previous build file {args.previous_build} is unreadable: {e}")
+    fails += check_file_count(result["count"], args.min_files, previous)
+    fails += check_contents(v1_dir)
+    try:
+        fails_3, result["coverage"] = check_coverage(load_course_list(args.course_list), result["found_ids"])
+        fails += fails_3
+    except Exception as e:
+        result["coverage_error"] = str(e)
+        fails.append(f"guard 3 (course list coverage): course list unavailable: {e}")
+    fails += check_sizes(v1_dir)
+    for line in fails:
+        log("FAILED " + line)
+    if fails:
+        raise SystemExit("publish guards failed:\n" + "\n".join(fails))
+    log("all four publish guards passed")
+
+
+def stage_seconds():
+    out = {}
+    for rec in STEPS:
+        out[rec["step"]] = round(out.get(rec["step"], 0.0) + rec["seconds"], 1)
+    return out
+
+
+def write_build_json(path, result, v1_dir):
+    sizes = {n: os.path.getsize(os.path.join(v1_dir, n)) for n in os.listdir(v1_dir)}
+    big = max(sizes, key=lambda n: sizes[n]) if sizes else None
+    cov = result["coverage"]
+    info = {"generated": result["generated"], "osm_base": result["osm_base"],
+            "files": len(sizes), "bytes": sum(sizes.values()),
+            "largest": {"id": big[:-len(".json.gz")].replace("-", ":"), "bytes": sizes[big]} if big else None,
+            "course_list_ids": cov["listed"], "course_list_missing": cov["listed"] - cov["found"],
+            "regions": [r["region"] for r in result["regions"]], "regions_added": result["regions_added"],
+            "seconds": stage_seconds()}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=1)
+        f.write("\n")
+
+
+# --- Build -------------------------------------------------------------------
+
 def build(args, result):
     only = [r.strip() for r in args.regions.split(",") if r.strip()]
+    if args.input and only:
+        raise SystemExit("--input and --regions cannot be used together")
+    for path in args.input:
+        if not os.path.isfile(path):
+            raise SystemExit(f"input file not found: {path}")
 
-    with step("region-list"):
-        regions = choose_regions(only)
+    if args.input:
+        jobs = [(os.path.basename(p), None, None, p, f"input{i}") for i, p in enumerate(args.input, 1)]
+    else:
+        with step("region-list"):
+            regions, result["regions_added"] = choose_regions(only, args.region_index)
+        jobs = [(rid, url, size, None, None) for rid, url, size in regions]
     if args.dry_run:
         return
 
     found_ids, region_recs = result["found_ids"], result["regions"]
-    for rid, url, size in regions:
-        process_region(rid, url, size, args.work, found_ids, region_recs)
+    for rid, url, size, local, slug in jobs:
+        process_region(rid, url, size, args.work, found_ids, region_recs, local, slug)
 
     near_files = [r["near_file"] for r in region_recs if "near_file" in r]
     if not near_files:
@@ -706,12 +944,15 @@ def build(args, result):
         log(f"loaded {len(nodes)} nodes, {len(ways)} ways, {len(rels)} relations, {len(courses)} courses")
 
     stamps = sorted(r["timestamp"] for r in region_recs if r.get("timestamp"))
-    result["osm_base"] = stamps[0] if stamps else ""
-    outdir = os.path.join(args.output, "v1")
+    result["osm_base"] = stamps[0] if stamps else None
+    stage = os.path.join(args.work, "stage")
+    shutil.rmtree(stage, ignore_errors=True)
+    outdir = os.path.join(stage, "v1")
+    os.makedirs(outdir)
     with step("assign-trim-write"):
         for key, elements in assign(nodes, ways, rels, courses):
             course_id = f"osm:{key[0]}:{key[1]}"
-            body = json.dumps({"version": 1, "generated": result["generated"], "osm_base": result["osm_base"],
+            body = json.dumps({"version": 1, "generated": result["generated"], "osm_base": result["osm_base"] or "",
                                "copyright": "© OpenStreetMap contributors", "license": "ODbL 1.0",
                                "elements": trim(course_id, elements)},
                               separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -722,24 +963,38 @@ def build(args, result):
             result["total"] += len(data)
     log(f"done: {result['count']} files, {result['total'] / 1e6:.1f} MB compressed")
 
+    with step("guards"):
+        run_guards(args, result, outdir)
+    write_build_json(os.path.join(stage, "build.json"), result, outdir)
+    if os.path.isdir(args.output):
+        os.rmdir(args.output)  # main() checked that it is empty
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    shutil.move(stage, args.output)
+    log(f"published {result['count']} files to {args.output}")
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--regions", default="")
+    ap.add_argument("--input", action="append", default=[], help="local .osm or .osm.pbf file instead of Geofabrik regions; repeatable")
+    ap.add_argument("--region-index", default=INDEX_URL, help="Geofabrik index-v1.json, file or URL")
     ap.add_argument("--course-list", default=COURSE_LIST_URL)
+    ap.add_argument("--previous-build", help="the last build.json")
+    ap.add_argument("--min-files", type=int, default=MIN_FILES)
     ap.add_argument("--report")
     ap.add_argument("--dry-run", action="store_true", help="print the region list and stop")
     args = ap.parse_args()
 
+    if os.path.exists(args.output) and (not os.path.isdir(args.output) or os.listdir(args.output)):
+        raise SystemExit(f"--output {args.output} must be absent or an empty folder")
     os.makedirs(args.work, exist_ok=True)
-    os.makedirs(os.path.join(args.output, "v1"), exist_ok=True)
     STATE["work"] = args.work
     signal.signal(signal.SIGTERM, terminate)  # GitHub sends it on cancel and timeout
 
-    result = {"ok": False, "error": None, "generated": now(), "osm_base": "", "count": 0, "total": 0,
-           "found_ids": set(), "regions": []}
+    result = {"ok": False, "error": None, "generated": now(), "osm_base": None, "count": 0, "total": 0,
+           "found_ids": set(), "regions": [], "regions_added": []}
     try:
         build(args, result)
         result["ok"] = True

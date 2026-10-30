@@ -1,0 +1,100 @@
+name: Build hole maps
+
+on:
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: "Geofabrik region ids, comma separated (empty means all)"
+        required: false
+        default: ""
+        type: string
+      min_files:
+        description: "Smallest file count guard 1 accepts (empty means 15000)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install osmium-tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          osmium --version
+      - name: Run the tests
+        run: python3 -m unittest
+      - name: Build hole maps
+        env:
+          REGIONS: ${{ inputs.regions }}
+          MIN_FILES: ${{ inputs.min_files }}
+        run: |
+          args=(--work "${{ runner.temp }}/work" --output _site --report report.json)
+          if [ -f build.json ]; then args+=(--previous-build build.json); fi
+          if [ -n "$REGIONS" ]; then args+=(--regions "$REGIONS"); fi
+          if [ -n "$MIN_FILES" ]; then args+=(--min-files "$MIN_FILES"); fi
+          python3 build.py "${args[@]}"
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: report
+          path: report.json
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-json
+          path: _site/build.json
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  commit:
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-json
+          path: ${{ runner.temp }}/build-json
+      - name: Commit build.json
+        run: |
+          cp "${{ runner.temp }}/build-json/build.json" build.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build.json
+          if git diff --cached --quiet; then
+            echo "build.json unchanged"
+            exit 0
+          fi
+          git commit -m "chore: record the weekly build"
+          git push origin main
