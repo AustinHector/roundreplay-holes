@@ -1,14 +1,14 @@
 {
- "generated": "2026-11-01T16:00:17Z",
- "osm_base": "2026-10-30T21:24:51Z",
- "files": 16817,
- "bytes": 407875264,
+ "generated": "2026-11-08T13:21:39Z",
+ "osm_base": "2026-11-07T21:21:36Z",
+ "files": 16923,
+ "bytes": 409930700,
  "largest": {
   "id": "osm:way:36851183",
-  "bytes": 360473
+  "bytes": 360469
  },
- "course_list_ids": 38025,
- "course_list_missing": 127,
+ "course_list_ids": 38013,
+ "course_list_missing": 59,
  "regions": [
   "antarctica",
   "australia-oceania",
@@ -255,73 +255,73 @@
   }
  ],
  "seconds": {
-  "download": 80781.9,
+  "download": 8814.4,
   "fileinfo": 0.0,
-  "filter": 2535.7,
-  "course-boxes": 228.2,
-  "extract": 325.3,
-  "merge": 13.8,
-  "add-locations": 12.8,
-  "load": 80.2,
-  "assign-trim-write": 243.6,
-  "guards": 34.7
+  "filter": 2245.3,
+  "course-boxes": 209.6,
+  "extract": 284.1,
+  "merge": 22.5,
+  "add-locations": 12.7,
+  "load": 119.3,
+  "assign-trim-write": 423.2,
+  "guards": 51.3
  },
  "shards": [
   {
    "shard": 0,
-   "regions": 27,
-   "bytes": 10526895951,
-   "download_seconds": 10192.9,
-   "seconds": 10620.9
+   "regions": 26,
+   "bytes": 10538805307,
+   "download_seconds": 1238.2,
+   "seconds": 1573.4
   },
   {
    "shard": 1,
    "regions": 26,
-   "bytes": 10526154103,
-   "download_seconds": 7147.2,
-   "seconds": 7547.8
+   "bytes": 10538856440,
+   "download_seconds": 810.4,
+   "seconds": 1086.3
   },
   {
    "shard": 2,
    "regions": 27,
-   "bytes": 10526201734,
-   "download_seconds": 11221.8,
-   "seconds": 11507.4
+   "bytes": 10537661648,
+   "download_seconds": 1176.3,
+   "seconds": 1578.9
   },
   {
    "shard": 3,
    "regions": 28,
-   "bytes": 10526343499,
-   "download_seconds": 10801.0,
-   "seconds": 11194.9
+   "bytes": 10537554865,
+   "download_seconds": 1050.2,
+   "seconds": 1428.0
   },
   {
    "shard": 4,
-   "regions": 27,
-   "bytes": 10525497692,
-   "download_seconds": 9573.1,
-   "seconds": 9986.4
+   "regions": 28,
+   "bytes": 10537781747,
+   "download_seconds": 1123.4,
+   "seconds": 1420.1
   },
   {
    "shard": 5,
    "regions": 28,
-   "bytes": 10527486690,
-   "download_seconds": 10109.2,
-   "seconds": 10496.2
+   "bytes": 10537730451,
+   "download_seconds": 1239.7,
+   "seconds": 1627.5
   },
   {
    "shard": 6,
    "regions": 28,
-   "bytes": 10527054160,
-   "download_seconds": 10689.2,
-   "seconds": 11069.8
+   "bytes": 10539132521,
+   "download_seconds": 1019.8,
+   "seconds": 1292.1
   },
   {
    "shard": 7,
    "regions": 29,
-   "bytes": 10525537254,
-   "download_seconds": 11047.6,
-   "seconds": 11450.1
+   "bytes": 10538319545,
+   "download_seconds": 1155.9,
+   "seconds": 1548.4
   }
  ]
 }
